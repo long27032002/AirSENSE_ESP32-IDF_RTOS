@@ -86,6 +86,7 @@ esp_err_t sdcard_initialize(esp_vfs_fat_sdmmc_mount_config_t *_mount_config, sdm
  */
 esp_err_t sdcard_writeDataToFile(const char *nameFile, const char *format, ...);
 
+int sdcard_writeStringToFile(const char *nameFile, const char *dataStr);
 
 /**
  * @brief Read data to file follow format.

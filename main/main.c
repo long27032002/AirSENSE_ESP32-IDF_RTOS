@@ -25,23 +25,26 @@
 #include "esp_system.h"
 #include "esp_cpu.h"
 #include "esp_mem.h"
-#include "esp_wifi.h"
-#include "esp_wifi_types.h"
-// #include "esp_event_loop.h"
 #include "esp_event.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_chip_info.h"
+#include "esp_pm.h"
+
+#include "esp_wifi.h"
+#include "esp_wifi_types.h"
+#include "mqtt_client.h"
+#include "esp_tls.h"
+#include "esp_ota_ops.h"
+#include "esp_eap_client.h"
+#include "esp_smartconfig.h"
+
 #include "esp_flash.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "esp_attr.h"
-// #include "esp_spi_flash.h"
 #include <spi_flash_mmap.h>
-#include "mqtt_client.h"
-#include "esp_tls.h"
-#include "esp_ota_ops.h"
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -81,11 +84,7 @@ __attribute__((unused)) static const char *TAG = "Main";
 
 #define QUEUE_SIZE 10U
 #define NAME_FILE_QUEUE_SIZE 5U
-
-static EventGroupHandle_t fileStore_eventGroup;
-
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_CONNECT_FAIL_BIT BIT1
+#define DATA_SENSOR_MIDLEWARE_QUEUE_SIZE 20
 
 #define WIFI_AVAIABLE_BIT BIT0
 #define MQTT_CLIENT_CONNECTED WIFI_AVAIABLE_BIT
@@ -94,33 +93,45 @@ static EventGroupHandle_t fileStore_eventGroup;
 #define FILE_RENAME_NEWDAY BIT2
 #define FILE_RENAME_FROMSYNC BIT3
 
+#if CONFIG_POWER_SAVE_MIN_MODEM
+#define DEFAULT_PS_MODE WIFI_PS_MIN_MODEM
+#elif CONFIG_POWER_SAVE_MAX_MODEM
+#define DEFAULT_PS_MODE WIFI_PS_MAX_MODEM
+#elif CONFIG_POWER_SAVE_NONE
+#define DEFAULT_PS_MODE WIFI_PS_NONE
+#else
+#define DEFAULT_PS_MODE WIFI_PS_NONE
+#endif /*CONFIG_POWER_SAVE_MODEM*/
 
+#define DEFAULT_LISTEN_INTERVAL CONFIG_WIFI_LISTEN_INTERVAL
+#define DEFAULT_BEACON_TIMEOUT  CONFIG_WIFI_BEACON_TIMEOUT
 
 TaskHandle_t getDataFromSensorTask_handle = NULL;
 TaskHandle_t saveDataSensorToSDcardTask_handle = NULL;
 TaskHandle_t saveDataSensorAfterReconnectWiFiTask_handle = NULL;
 TaskHandle_t mqttPublishMessageTask_handle = NULL;
-TaskHandle_t sntpGetTimeTask_handle = NULL;
-TaskHandle_t allocateDataToMQTTandSDQueue_handle = NULL;
+TaskHandle_t sntp_syncTimeTask_handle = NULL;
+TaskHandle_t allocateDataForMultipleQueuesTask_handle = NULL;
+TaskHandle_t smartConfigTask_handle = NULL;
 
 SemaphoreHandle_t getDataSensor_semaphore = NULL;
 SemaphoreHandle_t writeDataToSDcard_semaphore = NULL;
 SemaphoreHandle_t sentDataToMQTT_semaphore = NULL;
 SemaphoreHandle_t writeDataToSDcardNoWifi_semaphore = NULL;
-SemaphoreHandle_t allocateDataToMQTTandSDQueue_semaphore = NULL;
 
 QueueHandle_t dataSensorSentToSD_queue;
 QueueHandle_t dataSensorSentToMQTT_queue;
 QueueHandle_t moduleError_queue;
 QueueHandle_t nameFileSaveDataNoWiFi_queue;
 QueueHandle_t dateTimeLostWiFi_queue;
-QueueHandle_t dataSensorIntermediate_queue;
+QueueHandle_t dataSensorMidleware_queue;
+
+static EventGroupHandle_t fileStore_eventGroup;
 
 static struct statusDevice_st statusDevice = {0};
 
 static esp_mqtt_client_handle_t mqttClient_handle = NULL;
 static char nameFileSaveData[21];
-uint8_t MAC_addressArray[6];
 
 // Whether send data to MQTT queue or not (depend on WIFI connection)
 bool sendToMQTTQueue = false;
@@ -131,34 +142,34 @@ const char *formatDataSensorString = "{\n\t\"station_id\":\"%x%x%x%x\",\n\t\"Tim
 
 i2c_dev_t ds3231_device;
 
-bmp280_t bme280_device;
-bmp280_params_t bme280_params;
-
-uart_config_t pms_uart_config = UART_CONFIG_DEFAULT();
+bool wifi_firstConnect = true;
 
 /*------------------------------------ WIFI ------------------------------------ */
 
 static void mqtt_app_start(void);
 static void sntp_app_start(void);
-void sendDataSensorToMQTTServerAfterReconnectWiFi_task(void *parameters);
-
-static void WiFi_eventHandler( void *argument,  esp_event_base_t event_base,
-                                    int32_t event_id, void* event_data)
+static void smartConfig_task(void * parameter);
+void processDataAfterReconnectWiFi_task(void *parameters);
+static void WiFi_eventHandler( void *argument,  esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT)
     {
         switch (event_id)
         {
-        case WIFI_EVENT_STA_START: 
+        case WIFI_EVENT_STA_START:
+        {
+            xTaskCreate(smartConfig_task, "smartconfig_task", 1024 * 4, NULL, 15, &smartConfigTask_handle);
             ESP_LOGI(__func__, "Trying to connect with Wi-Fi...\n");
             esp_wifi_connect();
             break;
-
+        }
         case WIFI_EVENT_STA_CONNECTED:
+        {
             ESP_LOGI(__func__, "Wi-Fi connected AP SSID:%s password:%s.\n", CONFIG_SSID, CONFIG_PASSWORD);
             break;
-
+        }
         case WIFI_EVENT_STA_DISCONNECTED:
+        {
             /* When esp32 disconnect to wifi, this event become
             * active. We suspend the task mqttPublishMessageTask. */
             ESP_LOGI(__func__, "Wi-Fi disconnected: Retrying connect to AP SSID:%s password:%s", CONFIG_SSID, CONFIG_PASSWORD);
@@ -172,7 +183,7 @@ static void WiFi_eventHandler( void *argument,  esp_event_base_t event_base,
             }
             esp_wifi_connect();
             break;
-
+        }
         default:
             break;
         }
@@ -184,7 +195,7 @@ static void WiFi_eventHandler( void *argument,  esp_event_base_t event_base,
 
             ESP_LOGI(__func__, "Starting MQTT Client...\n");
 #ifdef CONFIG_RTC_TIME_SYNC
-        if (sntpGetTimeTask_handle == NULL)
+        if (sntp_syncTimeTask_handle == NULL)
         {
             sntp_app_start();
         }
@@ -208,7 +219,7 @@ static void WiFi_eventHandler( void *argument,  esp_event_base_t event_base,
                 {
                     // Create task to send data from sensor read by getDataFromSensor_task() to MQTT queue after reconnect to Wifi
                     // Period 100ms
-                    xTaskCreate(sendDataSensorToMQTTServerAfterReconnectWiFi_task, "SendDataAfterReconnect", (1024 * 16), NULL, (UBaseType_t)15, &saveDataSensorAfterReconnectWiFiTask_handle);
+                    xTaskCreate(processDataAfterReconnectWiFi_task, "SendDataAfterReconnect", (1024 * 16), NULL, (UBaseType_t)15, &saveDataSensorAfterReconnectWiFiTask_handle);
                     if(saveDataSensorAfterReconnectWiFiTask_handle != NULL)
                     {
                         ESP_LOGW(__func__, "Create task reconnected OK.");
@@ -221,6 +232,66 @@ static void WiFi_eventHandler( void *argument,  esp_event_base_t event_base,
                 }
             }
         }
+    } else if (event_base == SC_EVENT) {
+        switch (event_id)
+        {
+        case SC_EVENT_SCAN_DONE:
+        {
+            ESP_LOGI(__func__, "Scan done.");
+            break;
+        }
+        case SC_EVENT_FOUND_CHANNEL:
+        {
+            ESP_LOGI(__func__, "Found channel.");
+            break;
+        }
+        case SC_EVENT_GOT_SSID_PSWD:
+        {
+            ESP_LOGI(__func__, "Got SSID and password.");
+
+            smartconfig_event_got_ssid_pswd_t *smartconfig_event = (smartconfig_event_got_ssid_pswd_t *)event_data;
+            wifi_config_t wifi_config;
+            uint8_t ssid[33] = { 0 };
+            uint8_t password[65] = { 0 };
+            uint8_t rvd_data[33] = { 0 };
+
+            bzero(&wifi_config, sizeof(wifi_config_t));
+            memcpy(wifi_config.sta.ssid, smartconfig_event->ssid, sizeof(wifi_config.sta.ssid));
+            memcpy(wifi_config.sta.password, smartconfig_event->password, sizeof(wifi_config.sta.password));
+            wifi_config.sta.bssid_set = smartconfig_event->bssid_set;
+            if (wifi_config.sta.bssid_set == true) {
+                memcpy(wifi_config.sta.bssid, smartconfig_event->bssid, sizeof(wifi_config.sta.bssid));
+            }
+
+            memcpy(ssid, smartconfig_event->ssid, sizeof(smartconfig_event->ssid));
+            memcpy(password, smartconfig_event->password, sizeof(smartconfig_event->password));
+            ESP_LOGI(TAG, "SSID:%s", ssid);
+            ESP_LOGI(TAG, "PASSWORD:%s", password);
+            if (smartconfig_event->type == SC_TYPE_ESPTOUCH_V2) {
+                ESP_ERROR_CHECK_WITHOUT_ABORT( esp_smartconfig_get_rvd_data(rvd_data, sizeof(rvd_data)) );
+                ESP_LOGI(TAG, "RVD_DATA:");
+                for (int i = 0; i < 33; i++) {
+                    printf("%02x ", rvd_data[i]);
+                }
+                printf("\n");
+            }
+
+            ESP_ERROR_CHECK_WITHOUT_ABORT( esp_wifi_disconnect() );
+            ESP_ERROR_CHECK_WITHOUT_ABORT( esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
+            esp_wifi_connect();
+            break;
+        }
+        case SC_EVENT_SEND_ACK_DONE:
+        {
+            xTaskNotifyGive(smartConfigTask_handle);
+            ESP_LOGI(__func__, "Send ACK done.");
+            break;
+        }
+        default:
+            break;
+        }
+    } else {
+        ESP_LOGI(__func__, "Other event id:%" PRIi32 "", event_id);
     }
 
     return;
@@ -237,18 +308,26 @@ void WIFI_initSTA(void)
     wifi_init_config_t WIFI_initConfig = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_init(&WIFI_initConfig));
 
-    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_any_id_Wifi;
     esp_event_handler_instance_t instance_got_ip;
+    esp_event_handler_instance_t instance_any_id_SmartConfig;
+
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &WiFi_eventHandler,
                                                         NULL,
-                                                        &instance_any_id));
+                                                        &instance_any_id_Wifi));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
                                                         &WiFi_eventHandler,
                                                         NULL,
                                                         &instance_got_ip));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_instance_register(SC_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &WiFi_eventHandler,
+                                                        NULL,
+                                                        &instance_any_id_SmartConfig));
+
 
     static wifi_config_t wifi_config = {
         .sta = {
@@ -268,7 +347,31 @@ void WIFI_initSTA(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
 
+#ifdef CONFIG_POWER_SAVE_MODE_ENABLE
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_inactive_time(WIFI_IF_STA, DEFAULT_BEACON_TIMEOUT));
+    ESP_LOGI(__func__, "Enable Power Save Mode.");
+    esp_wifi_set_ps(DEFAULT_PS_MODE);
+#endif // CONFIG_POWER_SAVE_MODE_ENABLE
+
     ESP_LOGI(__func__, "WIFI initialize STA finished.");
+}
+
+/**
+ * @brief SmartConfig task
+ * 
+ * @param parameter 
+ */
+static void smartConfig_task(void * parameter)
+{
+    ESP_ERROR_CHECK( esp_smartconfig_set_type(SC_TYPE_ESPTOUCH) );
+    smartconfig_start_config_t smartConfig_config = SMARTCONFIG_START_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK( esp_smartconfig_start(&smartConfig_config));
+    for(;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ESP_LOGI(TAG, "smartconfig over");
+        esp_smartconfig_stop();
+        vTaskDelete(NULL);
+    }
 }
 
 /*          -------------- MQTT --------------           */
@@ -337,10 +440,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
  */
 void mqttPublishMessage_task(void *parameters)
 {
-    char *mqttTopic = malloc(strlen((char *)parameters) + 1);
-    int _size_mqttTopic = sizeof(mqttTopic);
-    memset(mqttTopic, 0, _size_mqttTopic);
-    memcpy(mqttTopic, (char *)parameters, _size_mqttTopic);
+    uint8_t MAC_addressArray[6];
+    WORD_ALIGNED_ATTR char MAC_address[32] = {0};
+    esp_read_mac(MAC_addressArray, ESP_MAC_WIFI_STA); // Get MAC address of ESP32
+    sprintf(MAC_address, "%x%x%x%x%x%x", MAC_addressArray[0], MAC_addressArray[1], MAC_addressArray[2], MAC_addressArray[3], MAC_addressArray[4], MAC_addressArray[5]);
+
+    WORD_ALIGNED_ATTR char mqttTopic[64] = {0};
+    sprintf(mqttTopic,"%s/%s", "AirSENSE-Beta", MAC_address);
+
     sentDataToMQTT_semaphore = xSemaphoreCreateMutex();
 
     for (;;)
@@ -368,7 +475,6 @@ void mqttPublishMessage_task(void *parameters)
                                 dataSensorReceiveFromQueue.pm1_0,
                                 dataSensorReceiveFromQueue.pm2_5,
                                 dataSensorReceiveFromQueue.pm10);
-
                         error = esp_mqtt_client_publish(mqttClient_handle, (const char *)mqttTopic, mqttMessage, 0, 0, 0);
                         xSemaphoreGive(sentDataToMQTT_semaphore);
                         if (error == ESP_FAIL)
@@ -403,21 +509,12 @@ void mqttPublishMessage_task(void *parameters)
  */
 static void mqtt_app_start(void)
 {
-    WORD_ALIGNED_ATTR char MAC_address[32] = {0};
-    esp_read_mac(MAC_addressArray, ESP_MAC_WIFI_STA); // Get MAC address of ESP32
-    sprintf(MAC_address, "%" PRIx8 "%" PRIx8 "%" PRIx8 "%" PRIx8 "%" PRIx8 "%" PRIx8, MAC_address[0], MAC_address[1], MAC_address[2], MAC_address[3], MAC_address[4], MAC_address[5]);
-
-    WORD_ALIGNED_ATTR char mqttTopic[64] = {0};
-    WORD_ALIGNED_ATTR char mqttTopic_32bytes[32] = {0};
-    snprintf(mqttTopic_32bytes, (sizeof(mqttTopic) - 1),"%s", CONFIG_MQTT_TOPIC);
-    snprintf(mqttTopic, sizeof(mqttTopic), "%s/%s", mqttTopic_32bytes, MAC_address);
-
     const esp_mqtt_client_config_t mqtt_Config = {
         .broker = {
             .address = {
                 .uri = CONFIG_BROKER_URI,
                 .hostname = CONFIG_BROKER_HOST,
-                .transport = MQTT_TRANSPORT_OVER_TCP,
+                // .transport = MQTT_TRANSPORT_OVER_TCP,
                 .path = CONFIG_BROKER_URI,
                 .port = CONFIG_BROKER_PORT,
             },
@@ -443,7 +540,13 @@ static void mqtt_app_start(void)
     esp_mqtt_client_register_event(mqttClient_handle, ESP_EVENT_ANY_ID, mqtt_event_handler, mqttClient_handle);
     esp_mqtt_client_start(mqttClient_handle);
 
-    xTaskCreate(mqttPublishMessage_task, "MQTT Publish", (1024 * 16), (void *)mqttTopic, (UBaseType_t)10, &mqttPublishMessageTask_handle);
+    xTaskCreate(mqttPublishMessage_task, "MQTT Publish", (1024 * 16), NULL, (UBaseType_t)10, &mqttPublishMessageTask_handle);
+}
+
+void sntp_functionCallback(struct timeval *timeValue)
+{
+    xEventGroupSetBits(fileStore_eventGroup, FILE_RENAME_FROMSYNC);
+    return;
 }
 
 /**
@@ -452,20 +555,25 @@ static void mqtt_app_start(void)
  *
  * @param parameter
  */
-void sntpGetTime_task(void *parameter)
+void sntp_syncTime_task(void *parameter)
 {
-    time_t timeNow = 0;
-    struct tm timeInfo = {0};
     do
     {
-        sntp_init_func();
-        ESP_ERROR_CHECK_WITHOUT_ABORT(sntp_setTime(&timeInfo, &timeNow));
-        mktime(&timeInfo);
-        if (timeInfo.tm_year < 130 && timeInfo.tm_year > 120)
+        esp_err_t errorReturn = sntp_syncTime();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(errorReturn);
+        if (errorReturn == ESP_OK)
         {
+            ds3231_getTimeString(&ds3231_device);
+            sntp_setTimmeZoneToVN();
+            ds3231_getTimeString(&ds3231_device);
+            struct tm timeInfo = {0};
+            time_t timeNow = 0;
+            time(&timeNow);
+            localtime_r(&timeNow, &timeInfo);
             ESP_ERROR_CHECK_WITHOUT_ABORT(ds3231_setTime(&ds3231_device, &timeInfo));
-            xEventGroupSetBits(fileStore_eventGroup, FILE_RENAME_FROMSYNC);
+            sntp_printServerInformation();
         }
+        sntp_deinit();
         vTaskDelete(NULL);
     } while (0);
 }
@@ -475,9 +583,13 @@ void sntpGetTime_task(void *parameter)
  *
  *
  */
-static void sntp_app_start()
+static void sntp_app_start(void)
 {
-    xTaskCreate(sntpGetTime_task, "SNTP Get Time", (1024 * 4), NULL, (UBaseType_t)10, &sntpGetTimeTask_handle);
+    if (sntp_initialize((void *)(&sntp_functionCallback)) == ESP_OK)
+    {
+        xTaskCreate(sntp_syncTime_task, "SNTP Get Time", (1024 * 4), NULL, (UBaseType_t)15, &sntp_syncTimeTask_handle);
+    }
+    return;
 }
 
 /*          -------------- *** --------------           */
@@ -495,73 +607,54 @@ static void initialize_nvs(void)
 
 void getDataFromSensor_task(void *parameters)
 {
-    struct dataSensor_st dataSensorTemp;
-    struct moduleError_st moduleErrorTemp;
+    struct dataSensor_st dataSensorTemp = {0};
+    struct moduleError_st moduleErrorTemp = {0};
     TickType_t task_lastWakeTime;
-    task_lastWakeTime = xTaskGetTickCount();
 
     getDataSensor_semaphore = xSemaphoreCreateMutex();
 
     for (;;)
     {
-#if (CONFIG_USING_RTC)
+        task_lastWakeTime = xTaskGetTickCount();
         if (xSemaphoreTake(getDataSensor_semaphore, portMAX_DELAY))
         {
+            ds3231_getTimeString(&ds3231_device);
+#if (CONFIG_USING_RTC)
             moduleErrorTemp.ds3231Error = ds3231_getEpochTime(&ds3231_device, &(dataSensorTemp.timeStamp));
+            if (moduleErrorTemp.ds3231Error != ESP_OK)
+            {
+                dataSensorTemp.timeStamp = dataSensorTemp.timeStamp + (uint64_t)((PERIOD_GET_DATA_FROM_SENSOR * portTICK_PERIOD_MS) / 1000);
+            }
+            
             if (ds3231_isNewDay(&ds3231_device))
             {
                 xEventGroupSetBits(fileStore_eventGroup, FILE_RENAME_NEWDAY);
             }
 #endif
+            dataSensorTemp.temperature = 27.03;
+            dataSensorTemp.humidity = 67.35;
+            dataSensorTemp.pressure = 1013.25;
+            dataSensorTemp.pm1_0 = 23;
+            dataSensorTemp.pm2_5 = 33;
+            dataSensorTemp.pm10 = 24;
 
-#if (CONFIG_USING_PMS7003)
-            moduleErrorTemp.pms7003Error = pms7003_readData(indoor, &(dataSensorTemp.pm1_0),
-                                                            &(dataSensorTemp.pm2_5),
-                                                            &(dataSensorTemp.pm10));
-#endif
-
-#if (CONFIG_USING_BME280)
-            moduleErrorTemp.bme280Error = bme280_readSensorData(&bme280_device, &(dataSensorTemp.temperature),
-                                                                &(dataSensorTemp.pressure),
-                                                                &(dataSensorTemp.humidity));
-#endif
             xSemaphoreGive(getDataSensor_semaphore); // Give mutex
-
-            // printf("%s,%llu,%.2f,%.2f,%.2f,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", CONFIG_NAME_DEVICE,
-            //        dataSensorTemp.timeStamp,
-            //        dataSensorTemp.temperature,
-            //        dataSensorTemp.humidity,
-            //        dataSensorTemp.pressure,
-            //        dataSensorTemp.pm1_0,
-            //        dataSensorTemp.pm2_5,
-            //        dataSensorTemp.pm10);
-
-            ESP_ERROR_CHECK_WITHOUT_ABORT(moduleErrorTemp.ds3231Error);
-            ESP_ERROR_CHECK_WITHOUT_ABORT(moduleErrorTemp.bme280Error);
-            ESP_ERROR_CHECK_WITHOUT_ABORT(moduleErrorTemp.pms7003Error);
 
             ESP_LOGI(__func__, "Read data from sensors completed!");
 
-            if (xSemaphoreTake(allocateDataToMQTTandSDQueue_semaphore, portMAX_DELAY) == pdPASS)
+            if (xQueueSendToBack(dataSensorMidleware_queue, (void *)&dataSensorTemp, WAIT_10_TICK * 10) != pdPASS)
             {
-                if (xQueueSendToBack(dataSensorIntermediate_queue, (void *)&dataSensorTemp, WAIT_10_TICK * 5) != pdPASS)
-                {
-                    ESP_LOGE(__func__, "Failed to post the data sensor to dataSensorIntermediate Queue.");
-                }
-                else
-                {
-                    ESP_LOGI(__func__, "Success to post the data sensor to dataSensorIntermediate Queue.");
-                }
+                ESP_LOGE(__func__, "Failed to post the data sensor to dataSensorMidleware Queue.");
             }
-            xSemaphoreGive(allocateDataToMQTTandSDQueue_semaphore);
+            else
+            {
+                ESP_LOGI(__func__, "Success to post the data sensor to dataSensorMidleware Queue.");
+            }
 
-            if (moduleError_queue != NULL &&
-                (moduleErrorTemp.ds3231Error != ESP_OK ||
-                 moduleErrorTemp.bme280Error != ESP_OK ||
-                 moduleErrorTemp.pms7003Error != ESP_OK))
+            if (moduleError_queue != NULL && (moduleErrorTemp.ds3231Error != ESP_OK))
             {
                 moduleErrorTemp.timestamp = dataSensorTemp.timeStamp;
-                if (xQueueSendToBack(moduleError_queue, (void *)&moduleErrorTemp, WAIT_10_TICK * 3) != pdPASS)
+                if (xQueueSendToBack(moduleError_queue, (void *)&moduleErrorTemp, WAIT_10_TICK * 5) != pdPASS)
                 {
                     ESP_LOGE(__func__, "Failed to post the moduleError to Queue.");
                 }
@@ -571,7 +664,7 @@ void getDataFromSensor_task(void *parameters)
                 }
             }
         }
-        memset(&dataSensorTemp, 0, sizeof(struct dataSensor_st));
+        //memset(&dataSensorTemp, 0, sizeof(struct dataSensor_st));
         memset(&moduleErrorTemp, 0, sizeof(struct moduleError_st));
         vTaskDelayUntil(&task_lastWakeTime, PERIOD_GET_DATA_FROM_SENSOR);
     }
@@ -583,50 +676,58 @@ void getDataFromSensor_task(void *parameters)
  * 
  * @param parameters 
  */
-void allocateDataToMQTTandSDQueue_task(void *parameters)
+void allocateDataForMultipleQueues_task(void *parameters)
 {
+    TickType_t task_timeDelay = PERIOD_SAVE_DATA_SENSOR_TO_SDCARD / portTICK_PERIOD_MS;
+    UBaseType_t message_stored = 0;
     struct dataSensor_st dataSensorReceiveFromQueue;
 
     for (;;)
     {
-        if (uxQueueMessagesWaiting(dataSensorIntermediate_queue) != 0)
-        {
-            if (xQueueReceive(dataSensorIntermediate_queue, (void *)&dataSensorReceiveFromQueue, portMAX_DELAY) == pdPASS)
-            {
-                ESP_LOGI(__func__, "Receiving data from intermediate queue successfully.");
+        message_stored = uxQueueMessagesWaiting(dataSensorMidleware_queue);
 
-                if (xSemaphoreTake(allocateDataToMQTTandSDQueue_semaphore, portMAX_DELAY) == pdTRUE)
+        if (message_stored != 0)
+        {
+            if (xQueueReceive(dataSensorMidleware_queue, (void *)&dataSensorReceiveFromQueue, portMAX_DELAY) == pdPASS)
+            {
+                ESP_LOGI(__func__, "Receiving data from Midleware queue successfully.");
+                if (xQueueSendToBack(dataSensorSentToSD_queue, (void *)&dataSensorReceiveFromQueue, portMAX_DELAY) != pdPASS)
                 {
-                    if (xQueueSendToBack(dataSensorSentToSD_queue, (void *)&dataSensorReceiveFromQueue, portMAX_DELAY) != pdPASS)
+                    ESP_LOGE(__func__, "Failed to post the data sensor to dataSensorSentToSD Queue.");
+                }
+                else
+                {
+                    ESP_LOGI(__func__, "Success to post the data sensor to dataSensorSentToSD Queue.");
+                }
+                if (sendToMQTTQueue == true) 
+                {
+                    if (xQueueSendToBack(dataSensorSentToMQTT_queue, (void *)&dataSensorReceiveFromQueue, portMAX_DELAY) != pdPASS)
                     {
-                        ESP_LOGE(__func__, "Failed to post the data sensor to dataSensorSentToSD Queue.");
+                        ESP_LOGE(__func__, "Failed to post the data sensor to dataSensorSentToMQTT Queue.");
                     }
                     else
                     {
-                        ESP_LOGI(__func__, "Success to post the data sensor to dataSensorSentToSD Queue.");
-                    }
-                    if (sendToMQTTQueue == true) 
-                    {
-                        if (xQueueSendToBack(dataSensorSentToMQTT_queue, (void *)&dataSensorReceiveFromQueue, portMAX_DELAY) != pdPASS)
-                        {
-                            ESP_LOGE(__func__, "Failed to post the data sensor to dataSensorSentToMQTT Queue.");
-                        }
-                        else
-                        {
-                            ESP_LOGI(__func__, "Success to post the data sensor to dataSensorSentToMQTT Queue.");
-                        }
+                        ESP_LOGI(__func__, "Success to post the data sensor to dataSensorSentToMQTT Queue.");
                     }
                 }
-                
-                xSemaphoreGive(allocateDataToMQTTandSDQueue_semaphore);
             }
             else
             {
                 ESP_LOGI(__func__, "Receiving data from queue failed.");
-                continue;
             }
+
+            // if (message_stored > (UBaseType_t)(0.5 * DATA_SENSOR_MIDLEWARE_QUEUE_SIZE))
+            // {
+            //     task_timeDelay = (100 * 0.5) / portTICK_PERIOD_MS;
+            // } else if (message_stored > (UBaseType_t)(0.9 * DATA_SENSOR_MIDLEWARE_QUEUE_SIZE)) {
+            //     task_timeDelay = (100 * (1 - 0.9)) / portTICK_PERIOD_MS;
+            // } else {
+            //     task_timeDelay = 100 / portTICK_PERIOD_MS;
+            // }
         }
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+
+        task_timeDelay = (PERIOD_SAVE_DATA_SENSOR_TO_SDCARD * (1 - ((float)message_stored / DATA_SENSOR_MIDLEWARE_QUEUE_SIZE))) / portTICK_PERIOD_MS;
+        vTaskDelay(task_timeDelay);
     }
 }
 
@@ -641,9 +742,10 @@ void fileEvent_task(void *parameters)
     SemaphoreHandle_t file_semaphore = NULL;
     file_semaphore = xSemaphoreCreateMutex();
     ds3231_convertTimeToString(&ds3231_device, nameFileSaveData, 10);
+    strcat(nameFileSaveData, "_noWiFi");
 
     for (;;)
-    {
+    { 
         EventBits_t bits = xEventGroupWaitBits(fileStore_eventGroup,
                                                FILE_RENAME_NEWDAY | MQTT_CLIENT_CONNECTED | MQTT_CLIENT_DISCONNECTED | FILE_RENAME_FROMSYNC,
                                                pdTRUE,
@@ -685,7 +787,7 @@ void fileEvent_task(void *parameters)
                     {
                         *position = '\0'; // Truncate the string at the underscore position
                     }
-                    ESP_LOGI(__func__, "Update file name after reconnect: %s", nameFileSaveData);
+                    ESP_LOGI(__func__, "Update file name after reconnect WiFi: %s", nameFileSaveData);
                 }
             }
             else if (bits & MQTT_CLIENT_DISCONNECTED)
@@ -716,11 +818,11 @@ void fileEvent_task(void *parameters)
 };
 
 /**
- * @brief This task read data from SD card (saved when lost Wifi) and push data to MQTT and SD queue
+ * @brief This task read data from SD card (saved when lost Wifi) and push data to dataSensorMidleware_queue queue
  *
  * @param parameters
  */
-void sendDataSensorToMQTTServerAfterReconnectWiFi_task(void *parameters)
+void processDataAfterReconnectWiFi_task(void *parameters)
 {
     struct tm timeLostWiFi = {0};
     char nameFileSaveDataLostWiFi[21];
@@ -762,30 +864,15 @@ void sendDataSensorToMQTTServerAfterReconnectWiFi_task(void *parameters)
                        &(dataSensorTemp.pm2_5),
                        &(dataSensorTemp.pm10));
 
-                /**
-                 * @warning: Do not use xSemaphoreTake() function here!!!
-                 */
-                // while (!(uxQueueMessagesWaiting(dataSensorSentToMQTT_queue) < (QUEUE_SIZE - 1)));
-
-                BaseType_t flag_checkSendToQueueSuccess = pdFAIL;
-
-                do
+                BaseType_t checkSendToQueueFlag = xQueueSendToBack(dataSensorMidleware_queue, (void *)&dataSensorTemp, portMAX_DELAY);
+                if (checkSendToQueueFlag != pdPASS)
                 {
-                    if(xSemaphoreTake(allocateDataToMQTTandSDQueue_semaphore, portMAX_DELAY) == pdPASS)
-                    {
-                        flag_checkSendToQueueSuccess = xQueueSendToBack(dataSensorIntermediate_queue, (void *)&dataSensorTemp, WAIT_100_TICK);
-                        if (flag_checkSendToQueueSuccess != pdPASS)
-                        {
-                            ESP_LOGW(__func__, "Failed to post the data sensor to dataSensorIntermediate Queue.  Queue size: %d (max 10).", uxQueueMessagesWaiting(dataSensorSentToMQTT_queue));
-                        }
-                        else
-                        {
-                            ESP_LOGI(__func__, "Success to post the data sensor to dataSensorIntermediate Queue.");
-                        }
-                        vTaskDelay(100 / portTICK_PERIOD_MS);
-                    }
-                    xSemaphoreGive(allocateDataToMQTTandSDQueue_semaphore);
-                } while (flag_checkSendToQueueSuccess != pdPASS);
+                    ESP_LOGW(__func__, "Failed to post the data sensor to dataSensorMidleware Queue.  Queue size: %d (max 10).", uxQueueMessagesWaiting(dataSensorSentToMQTT_queue));
+                }
+                else
+                {
+                    ESP_LOGI(__func__, "Success to post the data sensor to dataSensorMidleware Queue.");
+                }
 
                 vTaskDelay(100 / portTICK_PERIOD_MS);
             }
@@ -806,12 +893,16 @@ void sendDataSensorToMQTTServerAfterReconnectWiFi_task(void *parameters)
  */
 void saveDataSensorToSDcard_task(void *parameters)
 {
+    TickType_t task_timeDelay = PERIOD_SAVE_DATA_SENSOR_TO_SDCARD / portTICK_PERIOD_MS;
+    UBaseType_t message_stored = 0;
     struct dataSensor_st dataSensorReceiveFromQueue;
 
     writeDataToSDcard_semaphore = xSemaphoreCreateMutex();
     for (;;)
     {
-        if (uxQueueMessagesWaiting(dataSensorSentToSD_queue) != 0) // Check if dataSensorSentToSD_queue is empty
+        message_stored = uxQueueMessagesWaiting(dataSensorSentToSD_queue);
+
+        if (message_stored != 0) // Check if dataSensorSentToSD_queue not empty
         {
             if (xQueueReceive(dataSensorSentToSD_queue, (void *)&dataSensorReceiveFromQueue, WAIT_10_TICK * 50) == pdPASS) // Get data sesor from queue
             {
@@ -844,11 +935,36 @@ void saveDataSensorToSDcard_task(void *parameters)
             }
         }
 
-        vTaskDelay(PERIOD_SAVE_DATA_SENSOR_TO_SDCARD);
+        task_timeDelay = (PERIOD_SAVE_DATA_SENSOR_TO_SDCARD * (1 - ((float)message_stored / DATA_SENSOR_MIDLEWARE_QUEUE_SIZE))) / portTICK_PERIOD_MS;
+        vTaskDelay(task_timeDelay);
     }
 };
 
-/*------------------------------------ MAIN_APP ------------------------------------*/
+// void logErrorToSDcard_task(void *parameters)
+// {
+//     for (;;)
+//     {
+//         if (uxQueueMessagesWaiting(moduleError_queue) != 0)
+//         {
+//             struct errorModule_st errorModuleReceiveFromQueue;
+//             if (xQueueReceive(moduleError_queue, (void *)&errorModuleReceiveFromQueue, WAIT_10_TICK * 50) == pdPASS)
+//             {
+//                 ESP_LOGI(__func__, "Receiving data from queue successfully.");
+//                 ESP_LOGE(__func__, "Module %s error code: 0x%.4X", errorModuleReceiveFromQueue.moduleName, errorModuleReceiveFromQueue.errorCode);
+//             }
+//             else
+//             {
+//                 ESP_LOGI(__func__, "Receiving data from queue failed.");
+//             }
+//         }
+
+//     }
+// };
+
+
+/*****************************************************************************************************/
+/*-------------------------------  MAIN_APP DEFINE FUNCTIONS  ---------------------------------------*/
+/*****************************************************************************************************/
 
 void app_main(void)
 {
@@ -860,13 +976,13 @@ void app_main(void)
     esp_chip_info_t chip_info;
     uint32_t flash_size;
     esp_chip_info(&chip_info);
-    printf("This is %s chip with %d CPU core(s), %s%s%s%s, ",
-           CONFIG_IDF_TARGET,
-           chip_info.cores,
-           (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi/" : "",
-           (chip_info.features & CHIP_FEATURE_BT) ? "BT" : "",
-           (chip_info.features & CHIP_FEATURE_BLE) ? "BLE" : "",
-           (chip_info.features & CHIP_FEATURE_IEEE802154) ? ", 802.15.4 (Zigbee/Thread)" : "");
+        printf("This is %s chip with %d CPU core(s), %s%s%s%s, ",
+            CONFIG_IDF_TARGET,
+            chip_info.cores,
+            (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi/" : "",
+            (chip_info.features & CHIP_FEATURE_BT) ? "BT" : "",
+            (chip_info.features & CHIP_FEATURE_BLE) ? "BLE" : "",
+            (chip_info.features & CHIP_FEATURE_IEEE802154) ? ", 802.15.4 (Zigbee/Thread)" : "");
 
     unsigned major_rev = chip_info.revision / 100;
     unsigned minor_rev = chip_info.revision % 100;
@@ -878,8 +994,7 @@ void app_main(void)
     printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
 
     ESP_LOGI(__func__, "Name device: %s.", CONFIG_NAME_DEVICE);
-    ESP_LOGI(__func__, "Firmware version %s.", CONFIG_FIRMWARE_VERSION);
-
+    
     // Initialize nvs partition
     ESP_LOGI(__func__, "Initialize nvs partition.");
     initialize_nvs();
@@ -907,15 +1022,7 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(sdcard_initialize(&mount_config_t, &SDCARD, &host_t, &spi_bus_config_t, &slot_config));
 #endif // CONFIG_USING_SDCARD
 
-// Initialize BME280 Sensor
-#if (CONFIG_USING_BME280)
     ESP_ERROR_CHECK_WITHOUT_ABORT(i2cdev_init());
-    ESP_LOGI(__func__, "Initialize BME280 sensor(I2C/Wire%d).", CONFIG_BME_I2C_PORT);
-
-    ESP_ERROR_CHECK_WITHOUT_ABORT(bme280_init(&bme280_device, &bme280_params, BME280_ADDRESS,
-                                              CONFIG_BME_I2C_PORT, CONFIG_BME_PIN_NUM_SDA, CONFIG_BME_PIN_NUM_SCL));
-
-#endif // CONFIG_USING_BME280
 
 // Initialize RTC module
 #if (CONFIG_USING_RTC)
@@ -924,33 +1031,20 @@ void app_main(void)
     memset(&ds3231_device, 0, sizeof(i2c_dev_t));
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(ds3231_initialize(&ds3231_device, CONFIG_RTC_I2C_PORT, CONFIG_RTC_PIN_NUM_SDA, CONFIG_RTC_PIN_NUM_SCL));
-    // ds3231_convertTimeToString(&ds3231_device, nameFileSaveData, 10);
 #endif // CONFIG_USING_RTC
 
-#if (CONFIG_USING_PMS7003)
-    ESP_ERROR_CHECK_WITHOUT_ABORT(pms7003_initUart(&pms_uart_config));
+    xTaskCreate(fileEvent_task, "EventFile", (1024 * 8), NULL, (UBaseType_t)7, NULL);
 
-    uint32_t pm1p0_t, pm2p5_t, pm10_t;
-    while (pms7003_readData(indoor, &pm1p0_t, &pm2p5_t, &pm10_t) != ESP_OK); // Waiting for PMS7003 sensor read data from RX buffer
-
-#endif // CONFIG_USING_PMS7003
-
-    xTaskCreate(fileEvent_task, "EventFile",
-                (1024 * 8),
-                NULL,
-                (UBaseType_t)7,
-                NULL);
-
-    // Creat dataSensorIntermediateQueue
-    dataSensorIntermediate_queue = xQueueCreate(30, sizeof(struct dataSensor_st));
-    while (dataSensorIntermediate_queue == NULL)
+    // Creat dataSensorMidlewareQueue
+    dataSensorMidleware_queue = xQueueCreate(DATA_SENSOR_MIDLEWARE_QUEUE_SIZE, sizeof(struct dataSensor_st));
+    while (dataSensorMidleware_queue == NULL)
     {
-        ESP_LOGE(__func__, "Create dataSensorIntermediate Queue failed.");
-        ESP_LOGI(__func__, "Retry to create dataSensorIntermediate Queue...");
+        ESP_LOGE(__func__, "Create dataSensorMidleware Queue failed.");
+        ESP_LOGI(__func__, "Retry to create dataSensorMidleware Queue...");
         vTaskDelay(500 / portTICK_PERIOD_MS);
-        dataSensorIntermediate_queue = xQueueCreate(30, sizeof(struct dataSensor_st));
+        dataSensorMidleware_queue = xQueueCreate(DATA_SENSOR_MIDLEWARE_QUEUE_SIZE, sizeof(struct dataSensor_st));
     };
-    ESP_LOGI(__func__, "Create dataSensorIntermediate Queue success.");
+    ESP_LOGI(__func__, "Create dataSensorMidleware Queue success.");
 
     // Create dataSensorQueue
     dataSensorSentToSD_queue = xQueueCreate(QUEUE_SIZE, sizeof(struct dataSensor_st));
@@ -1010,19 +1104,31 @@ void app_main(void)
     // Period 5000ms
     xTaskCreate(saveDataSensorToSDcard_task, "SaveDataSensor", (1024 * 16), NULL, (UBaseType_t)10, &saveDataSensorToSDcardTask_handle);
 
-    // Semaphore that handle the immediate queue (that be used by 3 tasks) 
-    allocateDataToMQTTandSDQueue_semaphore = xSemaphoreCreateMutex();
-
-    // Creat task to allocate data to MQTT and SD queue from dataSensorIntermediate queue
-    xTaskCreate(allocateDataToMQTTandSDQueue_task, "AllocateData", (1024 * 16), NULL, (UBaseType_t)15, &allocateDataToMQTTandSDQueue_handle);
-    if (allocateDataToMQTTandSDQueue_handle != NULL)
+    // Creat task to allocate data to MQTT and SD queue from dataSensorMidleware queue
+    xTaskCreate(allocateDataForMultipleQueues_task, "AllocateData", (1024 * 16), NULL, (UBaseType_t)15, &allocateDataForMultipleQueuesTask_handle);
+    if (allocateDataForMultipleQueuesTask_handle != NULL)
     {
         ESP_LOGI(__func__, "Create task AllocateData successfully.");
     } else {
         ESP_LOGE(__func__, "Create task AllocateData failed.");
     }
 
-#if (CONFIG_USING_WIFI)
+#if CONFIG_USING_WIFI
+#if CONFIG_PM_ENABLE
+    // Configure dynamic frequency scaling:
+    // maximum and minimum frequencies are set in sdkconfig,
+    // automatic light sleep is enabled if tickless idle support is enabled.
+    esp_pm_config_t pm_config = {
+            .max_freq_mhz = CONFIG_MAX_CPU_FREQ_MHZ,
+            .min_freq_mhz = CONFIG_MIN_CPU_FREQ_MHZ,
+#if CONFIG_FREERTOS_USE_TICKLESS_IDLE
+            .light_sleep_enable = true
+#endif
+    };
+    ESP_ERROR_CHECK_WITHOUT_ABORT( esp_pm_configure(&pm_config) );
+#endif // CONFIG_PM_ENABLE
+
     WIFI_initSTA();
 #endif
+
 }

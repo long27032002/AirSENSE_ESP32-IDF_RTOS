@@ -47,6 +47,29 @@ esp_err_t sdcard_initialize(esp_vfs_fat_sdmmc_mount_config_t *_mount_config, sdm
     return ESP_OK;
 }
 
+esp_err_t sdcard_writeStringToFile(const char *nameFile, const char *dataString)
+{
+    char pathFile[64];
+    sprintf(pathFile, "%s/%s.txt", mount_point, nameFile);
+
+    ESP_LOGI(__func__, "Opening file %s...", pathFile);
+    FILE *file = fopen(pathFile, "a+");
+    if (file == NULL)
+    {
+        ESP_LOGE(__func__, "Failed to open file for writing.");
+        return ESP_ERROR_SD_OPEN_FILE_FAILED;
+    }
+
+    int returnValue = 0;
+    returnValue = fprintf(file, "%s", dataString);
+    if (returnValue < 0)
+    {
+        ESP_LOGE(__func__, "Failed to write data to file %s.", pathFile);
+        return ESP_ERROR_SD_WRITE_DATA_FAILED;
+    }
+    ESP_LOGI(__func__, "Success to write data to file %s.", pathFile);
+    return ESP_OK;
+}
 
 esp_err_t sdcard_writeDataToFile(const char *nameFile, const char *format, ...)
 {
